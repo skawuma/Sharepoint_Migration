@@ -154,7 +154,7 @@ Put something like this inside:
     # TARGET
     TargetSiteUrl = "https://TARGET-SITE-URL"
 
-    TargetPageName = "Military-Personnel-Flight-Modern"
+    TargetPageName = ""
 
     TargetLibrary = "MPF Documents"
 
