@@ -1,0 +1,192 @@
+$ErrorActionPreference = "Stop"
+
+$RootPath   = "C:\SPModernization"
+$ConfigPath = Join-Path $RootPath "config.psd1"
+
+function Connect-ConfiguredPnP {
+    param([Parameter(Mandatory)][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Config.ClientId)) {
+        throw @"
+No approved Entra Application (client) ID is configured.
+
+Update ClientId in C:\SPModernization\config.psd1 only after the
+SharePoint/Entra administrator provides or confirms the approved app.
+"@
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Config.AzureEnvironment)) {
+        throw @"
+AzureEnvironment is not configured.
+
+Do not guess the cloud environment. Obtain the exact approved
+Connect-PnPOnline -AzureEnvironment value from the SharePoint/Entra
+administrator, then update C:\SPModernization\config.psd1.
+"@
+    }
+
+    Connect-PnPOnline `
+        -Url $Url `
+        -ClientId $Config.ClientId `
+        -AzureEnvironment $Config.AzureEnvironment `
+        -Interactive `
+        -ReturnConnection
+}
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " 307 FSS SHAREPOINT - ACCESS AND PREFLIGHT"
+Write-Host "============================================================"
+Write-Host ""
+
+if (-not (Test-Path $ConfigPath)) {
+    throw "Configuration file not found: $ConfigPath"
+}
+
+$Config = Import-PowerShellDataFile $ConfigPath
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "PowerShell 7 or later is required for this runbook."
+}
+
+$PnP = Get-Module PnP.PowerShell -ListAvailable |
+    Sort-Object Version -Descending |
+    Select-Object -First 1
+
+if (-not $PnP) {
+    throw "PnP.PowerShell is not installed."
+}
+
+Write-Host "PowerShell:     $($PSVersionTable.PSVersion)"
+Write-Host "PnP.PowerShell: $($PnP.Version)"
+Write-Host ""
+
+$Required = @(
+    "FssWebUrl",
+    "FssClassicHomePagePath",
+    "FssModernPageName",
+    "MpfWebUrl",
+    "MpfCurrentHomePagePath",
+    "PilotSectionName",
+    "ClientId",
+    "AzureEnvironment",
+    "Environment"
+)
+
+foreach ($Setting in $Required) {
+    if (-not $Config.ContainsKey($Setting) -or
+        [string]::IsNullOrWhiteSpace([string]$Config[$Setting])) {
+        throw "Missing configuration value: $Setting"
+    }
+}
+
+# ClientId must be the Application (client) ID and therefore a GUID.
+$ParsedClientId = [guid]::Empty
+if (-not [guid]::TryParse([string]$Config.ClientId, [ref]$ParsedClientId)) {
+    throw @"
+ClientId is not a valid GUID.
+
+Use the Application (client) ID of the approved Entra application.
+Do not use the Object ID, Tenant ID, client secret, or CAC PIN.
+"@
+}
+
+# Validate AzureEnvironment against the values exposed by this installed
+# PnP.PowerShell version when the parameter type is an enum.
+$AzureEnvironmentParameter =
+    (Get-Command Connect-PnPOnline).Parameters["AzureEnvironment"]
+
+if (-not $AzureEnvironmentParameter) {
+    throw "The installed PnP.PowerShell version does not expose the AzureEnvironment parameter. Coordinate with the SharePoint/Entra administrator before continuing."
+}
+
+$EnvironmentType = $AzureEnvironmentParameter.ParameterType
+if ($EnvironmentType.IsEnum) {
+    $SupportedEnvironments = [Enum]::GetNames($EnvironmentType)
+    if ($SupportedEnvironments -notcontains [string]$Config.AzureEnvironment) {
+        throw @"
+AzureEnvironment '$($Config.AzureEnvironment)' is not one of the values
+recognized by this installed PnP.PowerShell version.
+
+Supported values on this workstation:
+$($SupportedEnvironments -join ', ')
+
+Do not choose one by guesswork. Confirm the exact value with the
+SharePoint/Entra administrator.
+"@
+    }
+}
+
+foreach ($UrlName in @("FssWebUrl", "MpfWebUrl")) {
+    $Value = [string]$Config[$UrlName]
+    if ($Value -match '\.aspx($|\?)') {
+        throw "$UrlName must contain a SharePoint WEB URL, not a page URL: $Value"
+    }
+}
+
+$Directories = @(
+    "$RootPath\Scripts",
+    "$RootPath\Reports",
+    "$RootPath\Backup",
+    "$RootPath\Logs",
+    "$RootPath\Temp",
+    "$RootPath\Mappings"
+)
+
+foreach ($Directory in $Directories) {
+    if (-not (Test-Path $Directory)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+}
+
+Write-Host "FSS Web:  $($Config.FssWebUrl)"
+Write-Host "MPF Web:  $($Config.MpfWebUrl)"
+Write-Host "Client ID:  $($Config.ClientId)"
+Write-Host "Cloud env:  $($Config.AzureEnvironment)"
+Write-Host "Mode:      $($Config.Environment)"
+Write-Host ""
+
+if ($Config.Environment.ToUpper() -eq "PROD") {
+    Write-Warning "Configuration is marked PROD."
+    $Confirm = Read-Host "Type PRODUCTION to continue with read-only preflight"
+    if ($Confirm -ne "PRODUCTION") {
+        throw "Preflight cancelled."
+    }
+}
+
+Write-Host "Connecting to FSS..."
+$FssConnection = Connect-ConfiguredPnP -Url $Config.FssWebUrl
+$FssWeb = Get-PnPWeb -Includes Title,Url,ServerRelativeUrl -Connection $FssConnection
+Write-Host "[PASS] FSS read access: $($FssWeb.Title)"
+
+Write-Host "Connecting to MPF..."
+$MpfConnection = Connect-ConfiguredPnP -Url $Config.MpfWebUrl
+$MpfWeb = Get-PnPWeb -Includes Title,Url,ServerRelativeUrl -Connection $MpfConnection
+Write-Host "[PASS] MPF read access: $($MpfWeb.Title)"
+
+Write-Host ""
+Write-Host "Attempting permission visibility check..."
+try {
+    $Admins = @(Get-PnPSiteCollectionAdmin -Connection $FssConnection -ErrorAction Stop)
+    Write-Host "[INFO] Site collection administrators can be enumerated. Count: $($Admins.Count)"
+}
+catch {
+    Write-Warning "Could not enumerate Site Collection Administrators. This does not by itself prove migration cannot proceed, but admin/owner access must be confirmed before write operations."
+}
+
+Write-Host ""
+Write-Host "Preservation decisions:"
+Write-Host "  VersionHistory:      $($Config.Preservation.VersionHistory)"
+Write-Host "  SystemMetadata:      $($Config.Preservation.SystemMetadata)"
+Write-Host "  UniquePermissions:   $($Config.Preservation.UniquePermissions)"
+Write-Host "  RetentionCompliance: $($Config.Preservation.RetentionCompliance)"
+Write-Host ""
+
+if ($Config.Preservation.Values -contains "UNDECIDED") {
+    Write-Warning "One or more preservation requirements are still UNDECIDED. Inventory may continue, but basic content-copy migration must not run yet."
+}
+
+Write-Host "============================================================"
+Write-Host " PREFLIGHT COMPLETE - NO SHAREPOINT CONTENT WAS CHANGED"
+Write-Host "============================================================"
+Write-Host "Next: .\Scripts\01-Discover-FSS-Topology.ps1"
